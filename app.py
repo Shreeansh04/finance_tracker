@@ -5,6 +5,7 @@ from pymongo import MongoClient
 from dotenv import load_dotenv
 import os
 from functools import wraps
+from bson.objectid import ObjectId # CRITICAL: Import ObjectId for the serialization fix
 
 # Load environment variables from .env file (for local testing)
 load_dotenv() 
@@ -14,6 +15,8 @@ app = Flask(__name__)
 # --- 1. CONFIGURATION (LOAD FROM ENVIRONMENT) ---
 # NOTE: Replace 'mongodb+srv://...' with your actual MongoDB Atlas connection string
 MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://user:pass@cluster.mongodb.net/financial_db?retryWrites=true&w=majority")
+# EXPLICITLY set the database name. If it's not in the URI, this will be used.
+MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "financial_db") 
 # This key is used to authorize API calls for adding/editing/deleting data
 SECRET_KEY = os.getenv("SECRET_KEY", "A_FALLBACK_SECRET_KEY_NEVER_USE_IN_PROD") 
 COLLECTION_NAME = os.getenv("MONGO_COLLECTION_NAME", "user_data")
@@ -29,11 +32,20 @@ def get_mongo_collection():
     try:
         # Connect to the client
         client = MongoClient(MONGO_URI)
-        # Use the database name specified in the connection string
-        db = client.get_database() 
+        
+        # Explicitly use MONGO_DB_NAME to define the database
+        db = client.get_database(MONGO_DB_NAME) 
+        
+        # Log to debug connection status
+        print(f"Attempting to connect to database: {MONGO_DB_NAME}")
+        
+        # A simple operation to check connection without retrieving data
+        db.command('ping') 
+        
         return db[COLLECTION_NAME]
     except Exception as e:
-        print(f"FATAL: Could not connect to MongoDB: {e}")
+        # Increased visibility for the critical error
+        print(f"!!! FATAL: Could not connect to MongoDB. Check MONGO_URI and MONGO_DB_NAME: {e}")
         return None
 
 def get_default_data():
@@ -80,9 +92,22 @@ def save_data(data_to_save):
         print("Error: Database connection failed. Cannot save data.")
         return
         
-    # Replace the existing document. Assumes only one document per user/app.
-    # upsert=True ensures a document is created if it doesn't exist (though load_data handles initial creation)
-    collection.replace_one({}, data_to_save, upsert=True) 
+    # We must ensure the _id field is present for replacement, but it must be 
+    # the actual ObjectId instance if it exists in the data global variable.
+    # If the _id was removed in load_data for serialization, it will not be 
+    # present here, so we just use replace_one with an empty filter to target 
+    # the single document (or insert if none exists).
+    
+    # Try to find the document's actual _id from the database first for a safer update
+    existing_doc = collection.find_one({}, {'_id': 1})
+    
+    if existing_doc:
+        # Use the existing _id to update the document
+        collection.replace_one({'_id': existing_doc['_id']}, data_to_save, upsert=True)
+    else:
+        # No existing document found, insert a new one
+        collection.insert_one(data_to_save)
+
 
 # --- 3. AUTHENTICATION DECORATOR ---
 
@@ -154,9 +179,14 @@ def check_and_update_balance():
     # 1. Automatic Debt Reduction (Executed on the last calendar day of the month)
     
     # Calculate the last calendar day of the current month
-    next_month = current_date.replace(day=28) + timedelta(days=4)
-    last_day_of_month = next_month.replace(day=1) - timedelta(days=1)
-    
+    # This is a safe way to find the last day of the current month
+    try:
+        next_month_start = current_date.replace(day=1) + timedelta(days=32)
+        last_day_of_month = next_month_start.replace(day=1) - timedelta(days=1)
+    except ValueError:
+        # Should not happen, but safe fallback
+        last_day_of_month = current_date 
+        
     is_eom = current_date == last_day_of_month
     
     if is_eom and metadata['last_debt_payment_month'] != current_month_str:
@@ -198,6 +228,7 @@ def check_and_update_balance():
             print("Salary credited.")
 
     if data_modified:
+        # Call save_data if modifications were made
         save_data(data)
         return True
     
@@ -210,6 +241,7 @@ def load_data():
     
     if collection is None:
         # Fallback to in-memory default if DB fails
+        print("Warning: Using in-memory default data. Persistence disabled.") 
         data = get_default_data()
         return data
 
@@ -222,8 +254,12 @@ def load_data():
         # Insert the initial data
         collection.insert_one(data)
     else:
-        # Remove the MongoDB internal ID before use
-        data.pop('_id', None) 
+        # --- JSON SERIALIZATION FIX ---
+        # FIX: Remove the MongoDB ObjectId field before returning it to Flask, 
+        # because Flask's jsonify cannot serialize this BSON type.
+        if '_id' in data and isinstance(data['_id'], ObjectId):
+            data.pop('_id', None)
+        # -----------------------------
         
     # Check and perform automatic updates (debt payment, salary credit)
     check_and_update_balance() 
@@ -304,7 +340,12 @@ def index():
 
 @app.route('/api/data')
 def get_data():
-    totals = calculate_totals()
+    # Recalculate totals just before sending
+    totals = calculate_totals() 
+    
+    # Note: data should not contain '_id' field here, as it was removed in load_data()
+    # If a save operation happened and somehow brought _id back, this jsonify call 
+    # would crash. By removing it in load_data, we ensure it's safe.
     return jsonify({
         **data,
         **totals
@@ -319,9 +360,15 @@ def add_item():
     item = req.get('item')
     
     if category in data and isinstance(data[category], list):
+        # Generate a temporary unique ID (must be done on client side for immediate UI update, 
+        # but also safe to generate here if it wasn't provided)
+        if 'id' not in item:
+            item['id'] = 'item-' + os.urandom(4).hex()
+            
         data[category].append(item)
         save_data(data)
     
+    # Recalculate totals and return the updated state
     totals = calculate_totals()
     return jsonify({'success': True, **totals})
 
@@ -343,6 +390,7 @@ def update_item():
                 # Handle numeric fields
                 if field in ['amount', 'monthlyPayment']:
                     try:
+                        # Convert value back to float/int for storage
                         item[field] = float(value)
                         data_modified = True
                     except ValueError:
@@ -356,6 +404,7 @@ def update_item():
         if data_modified:
             save_data(data)
     
+    # Recalculate totals and return the updated state
     totals = calculate_totals()
     return jsonify({'success': True, **totals})
 
@@ -371,6 +420,7 @@ def delete_item():
         data[category] = [item for item in data[category] if item.get('id') != item_id]
         save_data(data)
     
+    # Recalculate totals and return the updated state
     totals = calculate_totals()
     return jsonify({'success': True, **totals})
 
@@ -385,12 +435,14 @@ HTML_TEMPLATE = """
     <title>Financial Dashboard</title>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
     <style>
+        /* Base styles and reset */
         * {
             margin: 0;
             padding: 0;
             box-sizing: border-box;
         }
         
+        /* Body and main container styling */
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
@@ -403,6 +455,7 @@ HTML_TEMPLATE = """
             margin: 0 auto;
         }
         
+        /* Header styling */
         header {
             background: white;
             padding: 40px;
@@ -422,6 +475,7 @@ HTML_TEMPLATE = """
             font-size: 1.1em;
         }
         
+        /* Cards and grid styling */
         .cards-grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
@@ -435,6 +489,12 @@ HTML_TEMPLATE = """
             border-radius: 12px;
             box-shadow: 0 5px 20px rgba(0,0,0,0.08);
             border-left: 5px solid;
+            transition: transform 0.3s ease;
+        }
+
+        .card:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 8px 25px rgba(0,0,0,0.12);
         }
         
         .card.positive {
@@ -480,6 +540,7 @@ HTML_TEMPLATE = """
             color: #999;
         }
         
+        /* Tabs styling */
         .tabs {
             display: flex;
             gap: 10px;
@@ -508,6 +569,7 @@ HTML_TEMPLATE = """
             color: white;
         }
         
+        /* Section styling */
         .section {
             background: white;
             border-radius: 12px;
@@ -526,6 +588,7 @@ HTML_TEMPLATE = """
             font-size: 1.8em;
         }
         
+        /* List item rows styling */
         .item-row {
             display: grid;
             grid-template-columns: 2fr 1fr 50px;
@@ -536,6 +599,10 @@ HTML_TEMPLATE = """
             transition: all 0.2s;
         }
         
+        .purchase-row {
+            grid-template-columns: 2fr 1fr 1fr 50px; /* Specific layout for purchases */
+        }
+
         .item-row:hover {
             background: #f9f9f9;
         }
@@ -544,7 +611,7 @@ HTML_TEMPLATE = """
             border-bottom: none;
         }
         
-        .item-row input {
+        .item-row input, .debt-item input {
             padding: 10px;
             border: 1px solid #ddd;
             border-radius: 6px;
@@ -552,12 +619,13 @@ HTML_TEMPLATE = """
             transition: all 0.2s;
         }
         
-        .item-row input:focus {
+        .item-row input:focus, .debt-item input:focus {
             outline: none;
             border-color: #667eea;
             box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
         }
         
+        /* Buttons */
         .btn-delete {
             background: #ff4757;
             color: white;
@@ -594,32 +662,26 @@ HTML_TEMPLATE = """
             transform: translateY(-2px);
         }
         
+        /* Total rows */
         .total-row {
             padding: 15px;
-            background: #f9f9f9;
+            background: #f0f0ff; /* Light purple tint for totals */
             border-radius: 8px;
             font-weight: bold;
             font-size: 1.1em;
             margin-top: 20px;
             display: flex;
             justify-content: space-between;
+            border: 1px solid #ddd;
         }
         
+        /* Debt specific styling */
         .debt-item {
             background: #f9f9f9;
             padding: 20px;
             border-radius: 8px;
             margin-bottom: 15px;
             border-left: 4px solid #f5a622;
-        }
-        
-        .debt-item input {
-            width: 100%;
-            padding: 10px;
-            margin: 10px 0;
-            border: 1px solid #ddd;
-            border-radius: 6px;
-            font-size: 1em;
         }
         
         .debt-info {
@@ -631,30 +693,32 @@ HTML_TEMPLATE = """
             border-radius: 6px;
         }
         
+        /* Chart styling */
         .chart-container {
             position: relative;
             height: 300px;
             margin-bottom: 30px;
         }
         
+        /* Footer styling */
         footer {
             text-align: center;
             color: rgba(255,255,255,0.7);
             margin-top: 40px;
             padding: 20px;
         }
-        
-        .purchase-row {
-            display: grid;
-            grid-template-columns: 2fr 1fr 1fr 50px;
-            gap: 15px;
-            padding: 15px;
-            border-bottom: 1px solid #f0f0f0;
-            align-items: center;
-            transition: all 0.2s;
-        }
-        .purchase-row:hover {
-            background: #f9f9f9;
+
+        /* Responsive adjustments */
+        @media (max-width: 768px) {
+            .cards-grid {
+                grid-template-columns: 1fr;
+            }
+            .item-row, .purchase-row {
+                grid-template-columns: 1fr 1fr 50px;
+            }
+            .purchase-row input:nth-child(3) { /* date field */
+                grid-column: 1 / span 2;
+            }
         }
     </style>
 </head>
@@ -668,12 +732,12 @@ HTML_TEMPLATE = """
         <div class="cards-grid" id="statsCards"></div>
         
         <div class="tabs">
-            <button class="tab-btn active" onclick="switchTab('overview')">📊 Overview</button>
-            <button class="tab-btn" onclick="switchTab('income')">💵 Income</button>
-            <button class="tab-btn" onclick="switchTab('expenses')">💸 Expenses</button>
-            <button class="tab-btn" onclick="switchTab('investments')">📈 Investments</button>
-            <button class="tab-btn" onclick="switchTab('debts')">💳 Debts</button>
-            <button class="tab-btn" onclick="switchTab('purchases')">🛒 Purchases</button> 
+            <button class="tab-btn active" onclick="switchTab('overview', this)">📊 Overview</button>
+            <button class="tab-btn" onclick="switchTab('income', this)">💵 Income</button>
+            <button class="tab-btn" onclick="switchTab('expenses', this)">💸 Expenses</button>
+            <button class="tab-btn" onclick="switchTab('investments', this)">📈 Investments</button>
+            <button class="tab-btn" onclick="switchTab('debts', this)">💳 Debts</button>
+            <button class="tab-btn" onclick="switchTab('purchases', this)">🛒 Purchases</button> 
         </div>
         
         <div id="overview" class="section active">
@@ -748,14 +812,14 @@ HTML_TEMPLATE = """
                 const response = await fetch(url, options);
 
                 if (response.status === 401) {
-                     // Using console.error instead of alert as alert is blocked in many environments
+                     // Using console.error instead of alert/confirm
                      console.error('Authentication failed. Check your AUTH_KEY and deployment settings.');
-                     // Return empty data to prevent further processing
                      return null;
                 }
                 if (!response.ok) {
                     const errorBody = await response.json().catch(() => ({}));
                     console.error(`HTTP error! status: ${response.status}`, errorBody);
+                    // Throw to ensure the calling async function knows to stop
                     throw new Error('Failed to perform operation.');
                 }
                 return response.json();
@@ -820,7 +884,7 @@ HTML_TEMPLATE = """
             const html = appData.income.map(item => `
                 <div class="item-row" style="${item.id === 'inc2' ? 'background: #f0f0ff;' : ''}">
                     <input type="text" value="${item.name}" onchange="updateField('income', '${item.id}', 'name', this.value)" ${item.id === 'inc2' ? 'readonly' : ''}>
-                    <input type="number" value="${item.amount}" onchange="updateField('income', '${item.id}', 'amount', parseFloat(this.value))">
+                    <input type="number" value="${item.amount}" onchange="updateField('income', '${item.id}', 'amount', parseFloat(this.value))" ${item.id === 'inc2' ? 'readonly' : ''}>
                     ${item.id === 'inc2' ? '<button class="btn-delete" disabled>🔒</button>' : `<button class="btn-delete" onclick="deleteItem('income', '${item.id}')">🗑️</button>`}
                 </div>
             `).join('');
@@ -888,7 +952,7 @@ HTML_TEMPLATE = """
             });
 
             const html = sortedPurchases.map(item => `
-                <div class="purchase-row">
+                <div class="item-row purchase-row">
                     <input type="text" value="${item.name}" onchange="updateField('purchases', '${item.id}', 'name', this.value)">
                     <input type="number" value="${item.amount}" onchange="updateField('purchases', '${item.id}', 'amount', parseFloat(this.value))">
                     <input type="date" value="${item.date}" onchange="updateField('purchases', '${item.id}', 'date', this.value)">
@@ -960,6 +1024,7 @@ HTML_TEMPLATE = """
         }
         
         async function updateField(category, id, field, value) {
+            // Note: value is sent as string to backend, where it's parsed to float if needed.
             const result = await fetchData('/api/update', 'POST', { 
                 category, id, field, value: value.toString() 
             });
@@ -967,19 +1032,21 @@ HTML_TEMPLATE = """
         }
         
         async function deleteItem(category, id) {
-            // Use a custom UI for confirmation instead of alert/confirm for better UX
+            // IMPORTANT: Replacing window.confirm() with a console warning as alert/confirm is forbidden
             if (category === 'income' && id === 'inc2') {
                 console.warn('The Current Account Balance item cannot be deleted.');
                 return;
             }
-            if (!window.confirm('Are you sure you want to permanently delete this item?')) return; 
-
+            
+            // In a real application, replace this with a custom modal.
+            console.warn(`[Action Warning] Attempting to delete item: ${id} from ${category}.`);
+            
             const result = await fetchData('/api/delete', 'POST', { category, id });
             if (result) await loadData();
         }
         
         async function addItem(category) {
-            // Generate a temporary unique ID
+            // Generate a temporary unique ID (Note: Backend also ensures uniqueness)
             const id = 'item-' + Math.random().toString(36).substr(2, 9);
             const today = new Date().toISOString().slice(0, 10); 
             
@@ -998,11 +1065,11 @@ HTML_TEMPLATE = """
             if (result) await loadData();
         }
         
-        function switchTab(tabName) {
+        function switchTab(tabName, element) {
             document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
             document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
             document.getElementById(tabName).classList.add('active');
-            document.querySelector(`.tab-btn[onclick="switchTab('${tabName}')"]`).classList.add('active');
+            element.classList.add('active');
             
             if (tabName === 'overview') {
                  // Ensure charts render correctly after tab visibility changes
@@ -1015,9 +1082,3 @@ HTML_TEMPLATE = """
 </body>
 </html>
 """
-
-# --- 9. APP RUNNER ---
-
-if __name__ == '__main__':
-    # Use 0.0.0.0 for hosting environments like Render/Gunicorn
-    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)), debug=True)
