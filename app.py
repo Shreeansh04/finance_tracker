@@ -5,7 +5,7 @@ from pymongo import MongoClient
 from dotenv import load_dotenv
 import os
 from functools import wraps
-from bson.objectid import ObjectId # CRITICAL: Import ObjectId for the serialization fix
+from bson.objectid import ObjectId
 
 # Load environment variables from .env file (for local testing)
 load_dotenv() 
@@ -36,9 +36,6 @@ def get_mongo_collection():
         # Explicitly use MONGO_DB_NAME to define the database
         db = client.get_database(MONGO_DB_NAME) 
         
-        # Log to debug connection status
-        print(f"Attempting to connect to database: {MONGO_DB_NAME}")
-        
         # A simple operation to check connection without retrieving data
         db.command('ping') 
         
@@ -57,6 +54,9 @@ def get_default_data():
             {'id': 'inc1', 'name': 'Monthly Salary', 'amount': 116938},
             # inc2: Current Balance represents the DYNAMIC account balance
             {'id': 'inc2', 'name': 'Current Account Balance', 'amount': 45000},
+        ],
+        'one_time_inflow': [
+            {'id': 'oti1', 'name': 'Stock Sale Profit', 'amount': 12000, 'date': today},
         ],
         'expenses': [
             {'id': 'exp1', 'name': 'Rent', 'amount': 11000},
@@ -92,22 +92,45 @@ def save_data(data_to_save):
         print("Error: Database connection failed. Cannot save data.")
         return
         
-    # We must ensure the _id field is present for replacement, but it must be 
-    # the actual ObjectId instance if it exists in the data global variable.
-    # If the _id was removed in load_data for serialization, it will not be 
-    # present here, so we just use replace_one with an empty filter to target 
-    # the single document (or insert if none exists).
-    
-    # Try to find the document's actual _id from the database first for a safer update
     existing_doc = collection.find_one({}, {'_id': 1})
+    
+    # We must ensure we don't save the temporary _id if it's not the MongoDB ObjectId
+    save_doc = data_to_save.copy()
+    save_doc.pop('_id', None) 
     
     if existing_doc:
         # Use the existing _id to update the document
-        collection.replace_one({'_id': existing_doc['_id']}, data_to_save, upsert=True)
+        collection.replace_one({'_id': existing_doc['_id']}, save_doc, upsert=True)
     else:
         # No existing document found, insert a new one
-        collection.insert_one(data_to_save)
+        collection.insert_one(save_doc)
 
+
+# --- HELPER FUNCTIONS FOR BALANCE MANAGEMENT ---
+
+def find_balance_index(data):
+    """Safely finds the index of the 'Current Account Balance' item (inc2)."""
+    for i, item in enumerate(data.get('income', [])):
+        if item.get('id') == 'inc2':
+            return i
+    return -1
+
+def update_balance(data, category, amount_change):
+    """
+    Updates the 'Current Account Balance' based on a transaction's change amount.
+    amount_change is the NET change: (New Amount - Old Amount) or (Amount to be added/subtracted).
+    """
+    balance_idx = find_balance_index(data)
+    if balance_idx == -1:
+        print("Error: 'Current Account Balance' item (inc2) not found.")
+        return
+    
+    if category == 'one_time_inflow':
+        # Inflow adds to the balance (a positive change adds, a negative change subtracts)
+        data['income'][balance_idx]['amount'] += amount_change
+    elif category == 'purchases':
+        # Purchases subtract from the balance (a positive change subtracts, a negative change adds)
+        data['income'][balance_idx]['amount'] -= amount_change
 
 # --- 3. AUTHENTICATION DECORATOR ---
 
@@ -159,6 +182,7 @@ def check_and_update_balance():
     """
     Performs time-based updates: salary credit and debt reduction.
     Saves data if modified.
+    NOTE: One-time inflow/purchases are handled immediately in the API routes.
     """
     global data
     
@@ -179,12 +203,10 @@ def check_and_update_balance():
     # 1. Automatic Debt Reduction (Executed on the last calendar day of the month)
     
     # Calculate the last calendar day of the current month
-    # This is a safe way to find the last day of the current month
     try:
         next_month_start = current_date.replace(day=1) + timedelta(days=32)
         last_day_of_month = next_month_start.replace(day=1) - timedelta(days=1)
     except ValueError:
-        # Should not happen, but safe fallback
         last_day_of_month = current_date 
         
     is_eom = current_date == last_day_of_month
@@ -254,12 +276,8 @@ def load_data():
         # Insert the initial data
         collection.insert_one(data)
     else:
-        # --- JSON SERIALIZATION FIX ---
-        # FIX: Remove the MongoDB ObjectId field before returning it to Flask, 
-        # because Flask's jsonify cannot serialize this BSON type.
-        if '_id' in data and isinstance(data['_id'], ObjectId):
-            data.pop('_id', None)
-        # -----------------------------
+        # For safety/cleanliness, ensure the BSON ID is not in the working data
+        data.pop('_id', None)
         
     # Check and perform automatic updates (debt payment, salary credit)
     check_and_update_balance() 
@@ -292,6 +310,21 @@ def calculate_totals():
         except (ValueError, TypeError):
             continue
 
+    # --- One-Time Inflow Calculation ---
+    current_month_inflow_total = 0
+    total_all_time_inflow = 0
+    
+    for item in data.get('one_time_inflow', []):
+        try:
+            amount = float(item.get('amount', 0))
+            total_all_time_inflow += amount
+            inflow_date = datetime.strptime(item.get('date', '1900-01-01'), '%Y-%m-%d')
+            
+            if (inflow_date.year, inflow_date.month) == current_month_year:
+                current_month_inflow_total += amount
+        except (ValueError, TypeError):
+            continue
+    
     # --- Income/Balance Calculation ---
     balance_item = next((item for item in data.get('income', []) if item.get('id') == 'inc2'), {'amount': 0})
     current_balance = balance_item.get('amount', 0)
@@ -310,6 +343,7 @@ def calculate_totals():
     
     # Total Outflow (used for the Total Cash Flow Movement chart/stat)
     total_outflow_for_stats = monthly_recurring_outflow + current_month_purchases_total
+    total_inflow_for_stats = total_income_rate + current_month_inflow_total 
     
     # Monthly Forecast Remaining calculation
     remaining_after_recurring = total_income_rate - monthly_recurring_outflow
@@ -326,8 +360,12 @@ def calculate_totals():
         'currentMonthPurchasesTotal': current_month_purchases_total,
         'totalAllTimePurchases': total_all_time_purchases,
         
-        'totalOutflow': total_outflow_for_stats, # Total money movement this month
-        'remainingBalance': remaining_after_recurring, # Forecasted remaining money from recurring flow
+        'currentMonthInflowTotal': current_month_inflow_total,
+        'totalAllTimeInflow': total_all_time_inflow,
+        'totalInflowForStats': total_inflow_for_stats, 
+        
+        'totalOutflow': total_outflow_for_stats, 
+        'remainingBalance': remaining_after_recurring, 
         'isPositive': remaining_after_recurring >= 0
     }
 
@@ -336,16 +374,14 @@ def calculate_totals():
 
 @app.route('/')
 def index():
-    return render_template_string(HTML_TEMPLATE)
+    # Pass the updated HTML template
+    return render_template_string(HTML_TEMPLATE_UPDATED)
 
 @app.route('/api/data')
 def get_data():
     # Recalculate totals just before sending
     totals = calculate_totals() 
     
-    # Note: data should not contain '_id' field here, as it was removed in load_data()
-    # If a save operation happened and somehow brought _id back, this jsonify call 
-    # would crash. By removing it in load_data, we ensure it's safe.
     return jsonify({
         **data,
         **totals
@@ -365,7 +401,23 @@ def add_item():
         if 'id' not in item:
             item['id'] = 'item-' + os.urandom(4).hex()
             
+        # Ensure amount is treated as float/number
+        try:
+            amount = float(item.get('amount', 0))
+            item['amount'] = amount
+        except (TypeError, ValueError):
+            # If amount is not a valid number, treat as 0
+            amount = 0.0
+            item['amount'] = 0.0
+            
         data[category].append(item)
+        
+        # --- NEW LOGIC: Update Balance Immediately ---
+        if category in ['one_time_inflow', 'purchases']:
+            # For new items, amount_change is simply the item's amount.
+            update_balance(data, category, amount)
+        # -------------------------------------------
+        
         save_data(data)
     
     # Recalculate totals and return the updated state
@@ -387,18 +439,32 @@ def update_item():
     if category in data and isinstance(data[category], list):
         for item in data[category]:
             if item.get('id') == item_id:
+                old_amount = float(item.get('amount', 0))
+                
                 # Handle numeric fields
                 if field in ['amount', 'monthlyPayment']:
                     try:
                         # Convert value back to float/int for storage
-                        item[field] = float(value)
+                        new_amount = float(value)
+                        item[field] = new_amount
                         data_modified = True
                     except ValueError:
                         print(f"Warning: Invalid number value '{value}' for field '{field}'")
+                        new_amount = old_amount # Keep old amount for balance change calculation if parsing failed
                 # Handle all other fields (name, date)
                 else:
                     item[field] = value
                     data_modified = True
+                    new_amount = old_amount # Amount didn't change
+
+                # --- NEW LOGIC: Update Balance Immediately on amount change ---
+                if data_modified and category in ['one_time_inflow', 'purchases'] and field == 'amount':
+                    change = new_amount - old_amount
+                    
+                    # Update balance: change is the net difference (new - old).
+                    update_balance(data, category, change)
+                # -------------------------------------------------------------
+                
                 break
         
         if data_modified:
@@ -416,9 +482,37 @@ def delete_item():
     category = req.get('category')
     item_id = req.get('id')
     
+    data_modified = False
+    deleted_item = None
+    
     if category in data and isinstance(data[category], list):
+        # Find the item BEFORE filtering it out
+        deleted_item = next((item for item in data.get(category, []) if item.get('id') == item_id), None)
+        
+        # Filter the list (the actual deletion)
         data[category] = [item for item in data[category] if item.get('id') != item_id]
-        save_data(data)
+        
+        if deleted_item:
+            data_modified = True
+            
+            # --- NEW LOGIC: Undo Balance Change Immediately ---
+            if category in ['one_time_inflow', 'purchases']:
+                try:
+                    amount = float(deleted_item.get('amount', 0))
+                except (TypeError, ValueError):
+                    amount = 0.0
+                    
+                # Deleting means the net change is the negative of the original amount's effect.
+                # E.g., deleting an inflow of +1000 is a change of -1000.
+                if category == 'one_time_inflow':
+                    update_balance(data, category, -amount)
+                elif category == 'purchases':
+                    # Deleting a purchase means the net change is positive (undoing the debit)
+                    # Since update_balance subtracts for purchases, we pass -amount: -(-amount) = +amount
+                    update_balance(data, category, -amount)
+            # ------------------------------------------------
+            
+            save_data(data)
     
     # Recalculate totals and return the updated state
     totals = calculate_totals()
@@ -426,7 +520,8 @@ def delete_item():
 
 
 # --- 8. HTML TEMPLATE DEFINITION (Frontend Logic Update for Auth) ---
-HTML_TEMPLATE = """
+# NOTE: The HTML_TEMPLATE_UPDATED includes the new 'One-Time Inflow' tab, section, and rendering logic.
+HTML_TEMPLATE_UPDATED = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -599,8 +694,8 @@ HTML_TEMPLATE = """
             transition: all 0.2s;
         }
         
-        .purchase-row {
-            grid-template-columns: 2fr 1fr 1fr 50px; /* Specific layout for purchases */
+        .inflow-purchase-row { /* New class for date/amount/name rows */
+            grid-template-columns: 2fr 1fr 1fr 50px; 
         }
 
         .item-row:hover {
@@ -713,10 +808,10 @@ HTML_TEMPLATE = """
             .cards-grid {
                 grid-template-columns: 1fr;
             }
-            .item-row, .purchase-row {
+            .item-row, .inflow-purchase-row {
                 grid-template-columns: 1fr 1fr 50px;
             }
-            .purchase-row input:nth-child(3) { /* date field */
+            .inflow-purchase-row input:nth-child(3) { /* date field */
                 grid-column: 1 / span 2;
             }
         }
@@ -733,7 +828,8 @@ HTML_TEMPLATE = """
         
         <div class="tabs">
             <button class="tab-btn active" onclick="switchTab('overview', this)">📊 Overview</button>
-            <button class="tab-btn" onclick="switchTab('income', this)">💵 Income</button>
+            <button class="tab-btn" onclick="switchTab('income', this)">💵 Income (Recurring)</button>
+            <button class="tab-btn" onclick="switchTab('one_time_inflow', this)">➕ One-Time Inflow</button>
             <button class="tab-btn" onclick="switchTab('expenses', this)">💸 Expenses</button>
             <button class="tab-btn" onclick="switchTab('investments', this)">📈 Investments</button>
             <button class="tab-btn" onclick="switchTab('debts', this)">💳 Debts</button>
@@ -751,9 +847,15 @@ HTML_TEMPLATE = """
         </div>
         
         <div id="income" class="section">
-            <h2>💵 Income Sources</h2>
+            <h2>💵 Recurring Income Sources</h2>
             <div id="incomeList"></div>
             <button class="btn-add" onclick="addItem('income')">➕ Add Income Source</button>
+        </div>
+        
+        <div id="one_time_inflow" class="section">
+            <h2>➕ One-Time Inflow (e.g., Stock Sale, Bonus)</h2>
+            <div id="oneTimeInflowList"></div>
+            <button class="btn-add" onclick="addItem('one_time_inflow')">➕ Record New Inflow</button>
         </div>
         
         <div id="expenses" class="section">
@@ -818,7 +920,7 @@ HTML_TEMPLATE = """
                 }
                 if (!response.ok) {
                     const errorBody = await response.json().catch(() => ({}));
-                    console.error(`HTTP error! status: ${response.status}`, errorBody);
+                    console.error('HTTP error! status: ' + response.status, errorBody);
                     // Throw to ensure the calling async function knows to stop
                     throw new Error('Failed to perform operation.');
                 }
@@ -840,6 +942,7 @@ HTML_TEMPLATE = """
         function render() {
             renderStats();
             renderIncome();
+            renderOneTimeInflow(); 
             renderExpenses();
             renderInvestments();
             renderDebts();
@@ -848,32 +951,38 @@ HTML_TEMPLATE = """
         }
         
         function renderStats() {
-            const { currentBalance, totalIncomeRate, totalDebt, remainingBalance, isPositive, totalOutflow, currentMonthPurchasesTotal } = appData;
+            // Updated stats to reflect total inflow for stats
+            const { currentBalance, totalIncomeRate, totalDebt, remainingBalance, isPositive, totalOutflow, totalInflowForStats, currentMonthPurchasesTotal, currentMonthInflowTotal } = appData;
             
             const formatCurrency = (amount) => (amount || 0).toLocaleString('en-IN', {maximumFractionDigits: 0});
 
-            const statsHTML = `
-                <div class="card neutral">
-                    <div class="card-label">Current Account Balance</div>
-                    <div class="card-value">₹${formatCurrency(currentBalance)}</div>
-                    <div class="card-status">Cash available for spending</div>
-                </div>
-                <div class="card ${isPositive ? 'positive' : 'negative'}">
-                    <div class="card-label">Monthly Forecast Remaining</div>
-                    <div class="card-value">₹${formatCurrency(remainingBalance)}</div>
-                    <div class="card-status">Income Rate (${formatCurrency(totalIncomeRate)}) - Recurring Outflow</div>
-                </div>
-                <div class="card warning">
-                    <div class="card-label">Total Outflow (This Month)</div>
-                    <div class="card-value">₹${formatCurrency(totalOutflow)}</div>
-                    <div class="card-status">Total Money Spent Incl. Purchases (₹${formatCurrency(currentMonthPurchasesTotal)})</div>
-                </div>
-                <div class="card negative">
-                    <div class="card-label">Total Debt Outstanding</div>
-                    <div class="card-value">₹${formatCurrency(totalDebt)}</div>
-                    <div class="card-status">Principal amount before next payment</div>
-                </div>
-            `;
+            const statsHTML = '\
+                <div class="card neutral">\
+                    <div class="card-label">Current Account Balance</div>\
+                    <div class="card-value">₹' + formatCurrency(currentBalance) + '</div>\
+                    <div class="card-status">Cash available for spending (Updated with One-Time Transactions)</div>\
+                </div>\
+                <div class="card ' + (isPositive ? 'positive' : 'negative') + '">\
+                    <div class="card-label">Monthly Forecast Remaining (Recurring)</div>\
+                    <div class="card-value">₹' + formatCurrency(remainingBalance) + '</div>\
+                    <div class="card-status">Income Rate (' + formatCurrency(totalIncomeRate) + ') - Recurring Outflow</div>\
+                </div>\
+                <div class="card positive">\
+                    <div class="card-label">Total Inflow (This Month)</div>\
+                    <div class="card-value">₹' + formatCurrency(totalInflowForStats) + '</div>\
+                    <div class="card-status">Recurring Income + One-Time Inflow (₹' + formatCurrency(currentMonthInflowTotal) + ')</div>\
+                </div>\
+                <div class="card warning">\
+                    <div class="card-label">Total Outflow (This Month)</div>\
+                    <div class="card-value">₹' + formatCurrency(totalOutflow) + '</div>\
+                    <div class="card-status">Total Recurring & Purchases (₹' + formatCurrency(currentMonthPurchasesTotal) + ')</div>\
+                </div>\
+                <div class="card negative">\
+                    <div class="card-label">Total Debt Outstanding</div>\
+                    <div class="card-value">₹' + formatCurrency(totalDebt) + '</div>\
+                    <div class="card-status">Principal amount before next payment</div>\
+                </div>\
+            ';
             
             document.getElementById('statsCards').innerHTML = statsHTML;
         }
@@ -881,41 +990,73 @@ HTML_TEMPLATE = """
         function renderIncome() {
             const formatCurrency = (amount) => (amount || 0).toLocaleString('en-IN', {maximumFractionDigits: 0});
             
-            const html = appData.income.map(item => `
-                <div class="item-row" style="${item.id === 'inc2' ? 'background: #f0f0ff;' : ''}">
-                    <input type="text" value="${item.name}" onchange="updateField('income', '${item.id}', 'name', this.value)" ${item.id === 'inc2' ? 'readonly' : ''}>
-                    <input type="number" value="${item.amount}" onchange="updateField('income', '${item.id}', 'amount', parseFloat(this.value))" ${item.id === 'inc2' ? 'readonly' : ''}>
-                    ${item.id === 'inc2' ? '<button class="btn-delete" disabled>🔒</button>' : `<button class="btn-delete" onclick="deleteItem('income', '${item.id}')">🗑️</button>`}
-                </div>
-            `).join('');
+            const html = appData.income.map(item => '\
+                <div class="item-row" style="' + (item.id === 'inc2' ? 'background: #f0f0ff;' : '') + '">\
+                    <input type="text" value="' + item.name + '" onchange="updateField(\'income\', \'' + item.id + '\', \'name\', this.value)" ' + (item.id === 'inc2' ? 'readonly' : '') + '>\
+                    <input type="number" value="' + item.amount + '" onchange="updateField(\'income\', \'' + item.id + '\', \'amount\', parseFloat(this.value))" ' + (item.id === 'inc2' ? 'readonly' : '') + '>\
+                    ' + (item.id === 'inc2' ? '<button class="btn-delete" disabled>🔒</button>' : '<button class="btn-delete" onclick="deleteItem(\'income\', \'' + item.id + '\')">🗑️</button>') + '\
+                </div>\
+            ').join('');
             
-            document.getElementById('incomeList').innerHTML = html + `<div class="total-row">Total Income Rate <span>₹${formatCurrency(appData.totalIncomeRate)}</span></div>`;
+            document.getElementById('incomeList').innerHTML = html + '<div class="total-row">Total Recurring Income Rate <span>₹' + formatCurrency(appData.totalIncomeRate) + '</span></div>';
         }
         
+        // NEW RENDER FUNCTION: One-Time Inflow
+        function renderOneTimeInflow() { 
+            const formatCurrency = (amount) => (amount || 0).toLocaleString('en-IN', {maximumFractionDigits: 0});
+            
+            // Sort inflow by date descending
+            const sortedInflow = appData.one_time_inflow.slice().sort((a, b) => {
+                const dateA = a.date || '1900-01-01';
+                const dateB = b.date || '1900-01-01';
+                return dateB.localeCompare(dateA);
+            });
+
+            const html = sortedInflow.map(item => '\
+                <div class="item-row inflow-purchase-row">\
+                    <input type="text" value="' + item.name + '" onchange="updateField(\'one_time_inflow\', \'' + item.id + '\', \'name\', this.value)">\
+                    <input type="number" value="' + item.amount + '" onchange="updateField(\'one_time_inflow\', \'' + item.id + '\', \'amount\', parseFloat(this.value))">\
+                    <input type="date" value="' + item.date + '" onchange="updateField(\'one_time_inflow\', \'' + item.id + '\', \'date\', this.value)">\
+                    <button class="btn-delete" onclick="deleteItem(\'one_time_inflow\', \'' + item.id + '\')">🗑️</button>\
+                </div>\
+            ').join('');
+            
+            document.getElementById('oneTimeInflowList').innerHTML = html + '\
+                <div class="total-row" style="background: #e6e6fa;">\
+                    Total One-Time Inflow THIS MONTH \
+                    <span>₹' + formatCurrency(appData.currentMonthInflowTotal) + '</span>\
+                </div>\
+                <div class="total-row">\
+                    Total All-Time Inflow \
+                    <span>₹' + formatCurrency(appData.totalAllTimeInflow) + '</span>\
+                </div>';
+        }
+        // END NEW RENDER FUNCTION
+
         function renderExpenses() {
             const formatCurrency = (amount) => (amount || 0).toLocaleString('en-IN', {maximumFractionDigits: 0});
-            const html = appData.expenses.map(item => `
-                <div class="item-row">
-                    <input type="text" value="${item.name}" onchange="updateField('expenses', '${item.id}', 'name', this.value)">
-                    <input type="number" value="${item.amount}" onchange="updateField('expenses', '${item.id}', 'amount', parseFloat(this.value))">
-                    <button class="btn-delete" onclick="deleteItem('expenses', '${item.id}')">🗑️</button>
-                </div>
-            `).join('');
+            const html = appData.expenses.map(item => '\
+                <div class="item-row">\
+                    <input type="text" value="' + item.name + '" onchange="updateField(\'expenses\', \'' + item.id + '\', \'name\', this.value)">\
+                    <input type="number" value="' + item.amount + '" onchange="updateField(\'expenses\', \'' + item.id + '\', \'amount\', parseFloat(this.value))">\
+                    <button class="btn-delete" onclick="deleteItem(\'expenses\', \'' + item.id + '\')">🗑️</button>\
+                </div>\
+            ').join('');
             
-            document.getElementById('expensesList').innerHTML = html + `<div class="total-row">Total Expenses <span>₹${formatCurrency(appData.totalExpenses)}</span></div>`;
+            document.getElementById('expensesList').innerHTML = html + '<div class="total-row">Total Expenses <span>₹' + formatCurrency(appData.totalExpenses) + '</span></div>';
         }
         
         function renderInvestments() {
             const formatCurrency = (amount) => (amount || 0).toLocaleString('en-IN', {maximumFractionDigits: 0});
-            const html = appData.investments.map(item => `
-                <div class="item-row">
-                    <input type="text" value="${item.name}" onchange="updateField('investments', '${item.id}', 'name', this.value)">
-                    <input type="number" value="${item.amount}" onchange="updateField('investments', '${item.id}', 'amount', parseFloat(this.value))">
-                    <button class="btn-delete" onclick="deleteItem('investments', '${item.id}')">🗑️</button>
-                </div>
-            `).join('');
+            const html = appData.investments.map(item => '\
+                <div class="item-row">\
+                    <input type="text" value="' + item.name + '" onchange="updateField(\'investments\', \'' + item.id + '\', \'name\', this.value)">\
+                    <input type="number" value="' + item.amount + '" onchange="updateField(\'investments\', \'' + item.id + '\', \'amount\', parseFloat(this.value))">\
+                    <button class="btn-delete" onclick="deleteItem(\'investments\', \'' + item.id + '\')">🗑️</button>\
+                </div>\
+            ').join('');
             
-            document.getElementById('investmentsList').innerHTML = html + `<div class="total-row">Total Investments <span>₹${formatCurrency(appData.totalInvestments)}</span></div>`;
+            document.getElementById('investmentsList').innerHTML = html + '<div class="total-row">Total Investments <span>₹' + formatCurrency(appData.totalInvestments) + '</span></div>';
         }
         
         function renderDebts() {
@@ -925,17 +1066,17 @@ HTML_TEMPLATE = """
 
                 const months = monthlyPayment > 0 ? (amount / monthlyPayment).toFixed(1) : '∞';
                 
-                return `
-                    <div class="debt-item">
-                        <input type="text" placeholder="Creditor Name" value="${item.name}" onchange="updateField('debts', '${item.id}', 'name', this.value)">
-                        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
-                            <input type="number" placeholder="Total Debt" value="${amount}" onchange="updateField('debts', '${item.id}', 'amount', parseFloat(this.value))">
-                            <input type="number" placeholder="Monthly Payment" value="${monthlyPayment}" onchange="updateField('debts', '${item.id}', 'monthlyPayment', parseFloat(this.value))">
-                        </div>
-                        ${monthlyPayment > 0 ? `<div class="debt-info">⏱️ ${months} months remaining (before next payment)</div>` : `<div class="debt-info">⚠️ Set a monthly payment to see forecast</div>`}
-                        <button class="btn-delete" onclick="deleteItem('debts', '${item.id}')" style="width: 100%; margin-top: 10px;">🗑️ Delete</button>
-                    </div>
-                `;
+                return '\
+                    <div class="debt-item">\
+                        <input type="text" placeholder="Creditor Name" value="' + item.name + '" onchange="updateField(\'debts\', \'' + item.id + '\', \'name\', this.value)">\
+                        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">\
+                            <input type="number" placeholder="Total Debt" value="' + amount + '" onchange="updateField(\'debts\', \'' + item.id + '\', \'amount\', parseFloat(this.value))">\
+                            <input type="number" placeholder="Monthly Payment" value="' + monthlyPayment + '" onchange="updateField(\'debts\', \'' + item.id + '\', \'monthlyPayment\', parseFloat(this.value))">\
+                        </div>\
+                        ' + (monthlyPayment > 0 ? '<div class="debt-info">⏱️ ' + months + ' months remaining (before next payment)</div>' : '<div class="debt-info">⚠️ Set a monthly payment to see forecast</div>') + '\
+                        <button class="btn-delete" onclick="deleteItem(\'debts\', \'' + item.id + '\')" style="width: 100%; margin-top: 10px;">🗑️ Delete</button>\
+                    </div>\
+                ';
             }).join('');
             
             document.getElementById('debtsList').innerHTML = html;
@@ -951,28 +1092,28 @@ HTML_TEMPLATE = """
                 return dateB.localeCompare(dateA);
             });
 
-            const html = sortedPurchases.map(item => `
-                <div class="item-row purchase-row">
-                    <input type="text" value="${item.name}" onchange="updateField('purchases', '${item.id}', 'name', this.value)">
-                    <input type="number" value="${item.amount}" onchange="updateField('purchases', '${item.id}', 'amount', parseFloat(this.value))">
-                    <input type="date" value="${item.date}" onchange="updateField('purchases', '${item.id}', 'date', this.value)">
-                    <button class="btn-delete" onclick="deleteItem('purchases', '${item.id}')">🗑️</button>
-                </div>
-            `).join('');
+            const html = sortedPurchases.map(item => '\
+                <div class="item-row inflow-purchase-row">\
+                    <input type="text" value="' + item.name + '" onchange="updateField(\'purchases\', \'' + item.id + '\', \'name\', this.value)">\
+                    <input type="number" value="' + item.amount + '" onchange="updateField(\'purchases\', \'' + item.id + '\', \'amount\', parseFloat(this.value))">\
+                    <input type="date" value="' + item.date + '" onchange="updateField(\'purchases\', \'' + item.id + '\', \'date\', this.value)">\
+                    <button class="btn-delete" onclick="deleteItem(\'purchases\', \'' + item.id + '\')">🗑️</button>\
+                </div>\
+            ').join('');
             
-            document.getElementById('purchasesList').innerHTML = html + 
-                `<div class="total-row" style="background: #e6e6fa;">
-                    Total One-Time Purchases THIS MONTH 
-                    <span>₹${formatCurrency(appData.currentMonthPurchasesTotal)}</span>
-                </div>
-                <div class="total-row">
-                    Total All-Time Purchases 
-                    <span>₹${formatCurrency(appData.totalAllTimePurchases)}</span>
-                </div>`;
+            document.getElementById('purchasesList').innerHTML = html + '\
+                <div class="total-row" style="background: #e6e6fa;">\
+                    Total One-Time Purchases THIS MONTH \
+                    <span>₹' + formatCurrency(appData.currentMonthPurchasesTotal) + '</span>\
+                </div>\
+                <div class="total-row">\
+                    Total All-Time Purchases \
+                    <span>₹' + formatCurrency(appData.totalAllTimePurchases) + '</span>\
+                </div>';
         }
         
         function renderCharts() {
-            const { totalExpenses, totalInvestments, totalDebtPayment, totalIncomeRate } = appData;
+            const { totalExpenses, totalInvestments, totalDebtPayment, totalIncomeRate, totalOutflow, totalInflowForStats } = appData;
             
             Object.values(chartInstances).forEach(chart => chart?.destroy());
             chartInstances = {};
@@ -1000,23 +1141,23 @@ HTML_TEMPLATE = """
                 });
             }
             
-            // Breakdown Bar Chart (Shows total movement this month)
+            // Breakdown Bar Chart (Shows total movement this month - Updated to use new stats)
             const ctx2 = document.getElementById('breakdownChart');
             if (ctx2) {
                 chartInstances.breakdown = new Chart(ctx2, {
                     type: 'bar',
                     data: {
-                        labels: ['Income Rate', 'Total Outflow (This Month)'],
+                        labels: ['Total Inflow (This Month)', 'Total Outflow (This Month)'],
                         datasets: [{
                             label: 'Amount (₹)',
-                            data: [totalIncomeRate, appData.totalOutflow],
+                            data: [totalInflowForStats, totalOutflow], // Use updated stats
                             backgroundColor: ['#48bb78', '#f56565']
                         }]
                     },
                     options: {
                         responsive: true,
                         maintainAspectRatio: false,
-                        plugins: { legend: { display: true }, title: {display: true, text: 'Total Cash Flow Movement'} },
+                        plugins: { legend: { display: true }, title: {display: true, text: 'Total Cash Flow Movement (This Month)'} },
                         scales: { y: { beginAtZero: true } }
                     }
                 });
@@ -1039,7 +1180,7 @@ HTML_TEMPLATE = """
             }
             
             // In a real application, replace this with a custom modal.
-            console.warn(`[Action Warning] Attempting to delete item: ${id} from ${category}.`);
+            console.warn('Action Warning: Attempting to delete item: ' + id + ' from ' + category);
             
             const result = await fetchData('/api/delete', 'POST', { category, id });
             if (result) await loadData();
@@ -1055,6 +1196,8 @@ HTML_TEMPLATE = """
                 item = { id, name: 'New Debt', amount: 0, monthlyPayment: 0 };
             } else if (category === 'purchases') { 
                 item = { id, name: 'New Purchase', amount: 0, date: today }; 
+            } else if (category === 'one_time_inflow') { 
+                item = { id, name: 'New Inflow', amount: 0, date: today };
             } else if (category === 'income') {
                 item = { id, name: 'Other Monthly Income', amount: 0 }; 
             } else {
