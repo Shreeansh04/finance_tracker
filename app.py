@@ -14,11 +14,11 @@ app = Flask(__name__)
 
 # --- 1. CONFIGURATION (LOAD FROM ENVIRONMENT) ---
 # NOTE: Replace 'mongodb+srv://...' with your actual MongoDB Atlas connection string
-MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://user:pass@cluster.mongodb.net/financial_db?retryWrites=true&w=majority")
+MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://stealth:5OKgP24VCyduTBPK@cluster.mongodb.net/financial_db?retryWrites=true&w=majority")
 # EXPLICITLY set the database name. If it's not in the URI, this will be used.
 MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "financial_db") 
 # This key is used to authorize API calls for adding/editing/deleting data
-SECRET_KEY = os.getenv("SECRET_KEY", "A_FALLBACK_SECRET_KEY_NEVER_USE_IN_PROD") 
+SECRET_KEY = os.getenv("SECRET_KEY", "melovevideogames@10") 
 COLLECTION_NAME = os.getenv("MONGO_COLLECTION_NAME", "user_data")
 
 # Pass the secret key to the template for client-side authentication
