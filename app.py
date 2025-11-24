@@ -151,6 +151,7 @@ def get_last_working_day(year, month, offset=1):
     return None 
 
 def get_salary_date(year, month):
+    # Get the 3rd last working day of the month
     return get_last_working_day(year, month, offset=3)
 
 # --- 5. DYNAMIC UPDATE LOGIC ---
@@ -181,7 +182,7 @@ def check_and_update_balance():
     if is_eom and metadata['last_debt_payment_month'] != current_month_str:
         print(f"Executing monthly debt payment for {current_month_str}...")
         
-        total_payment = sum(debt.get('monthlyPayment', 0) for debt in data.get('debts', []))
+        total_payment = sum(_safe_float(debt.get('monthlyPayment', 0)) for debt in data.get('debts', []))
 
         if balance_item:
             balance_item['amount'] = _safe_float(balance_item.get('amount', 0)) - total_payment
@@ -244,6 +245,12 @@ def load_data():
         data.setdefault('purchases', [])
         data.setdefault('one_time_inflows', [])
         data.setdefault('metadata', {'last_balance_update_month': None, 'last_debt_payment_month': None})
+        
+        # --- ENSURE ESSENTIAL ITEMS ARE PRESENT (NEW FIX) ---
+        # Crucial check to ensure inc2 (Current Balance) exists before balance adjustments run
+        if not next((i for i in data.get('income', []) if i.get('id') == 'inc2'), None):
+            print("WARNING: 'Current Account Balance' item (inc2) was missing. Restoring default.")
+            data['income'].append({'id': 'inc2', 'name': 'Current Account Balance', 'amount': 0.0})
         
         # --- DATA CLEANING FIX (CRITICAL FOR NaN/Non-numeric strings) ---
         for category in ['income', 'expenses', 'investments', 'purchases', 'one_time_inflows']:
@@ -372,11 +379,13 @@ def add_item():
 
         data[category].append(item)
         
+        # Note: Balance adjustment for one-time inflow is handled in /api/update when amount is changed from 0
         if category == 'one_time_inflows':
             balance_item = next((i for i in data.get('income', []) if i.get('id') == 'inc2'), None)
             if balance_item and 'amount' in item:
                 inflow_amount = item.get('amount', 0.0)
-                balance_item['amount'] = _safe_float(balance_item.get('amount', 0.0)) + inflow_amount
+                # This only runs for the initial add (amount=0). It's harmless, but kept for future proofing.
+                balance_item['amount'] = _safe_float(balance_item.get('amount', 0.0)) + inflow_amount 
                 print(f"Updated current balance with one-time inflow of: {inflow_amount}")
 
         save_data(data)
@@ -411,6 +420,7 @@ def update_item():
                         balance_item = next((i for i in data.get('income', []) if i.get('id') == 'inc2'), None)
                         if balance_item:
                             delta = new_value - old_value
+                            # CRITICAL: Apply the delta to the current balance
                             balance_item['amount'] = _safe_float(balance_item.get('amount', 0.0)) + delta
                             print(f"Adjusted current balance by {delta} due to update in one-time inflow.")
                     
@@ -446,6 +456,7 @@ def delete_item():
             balance_item = next((i for i in data.get('income', []) if i.get('id') == 'inc2'), None)
             if balance_item and 'amount' in item_to_delete:
                 inflow_amount = _safe_float(item_to_delete.get('amount', 0.0))
+                # CRITICAL: Subtract the amount of the deleted inflow
                 balance_item['amount'] = _safe_float(balance_item.get('amount', 0.0)) - inflow_amount
                 print(f"Adjusted current balance by -{inflow_amount} after deleting one-time inflow.")
 
@@ -857,7 +868,6 @@ HTML_TEMPLATE = """
                     throw new Error('Failed to perform operation or received invalid data.');
                 }
                 
-                // CRITICAL: The error comes from response.json() trying to parse "NaN"
                 const result = await response.json();
                 return result;
 
@@ -1123,6 +1133,7 @@ HTML_TEMPLATE = """
         }
         
         async function addItem(category) {
+            // Generate a temporary unique ID (Note: Backend also ensures uniqueness)
             const id = 'item-' + Math.random().toString(36).substr(2, 9);
             const today = new Date().toISOString().slice(0, 10); 
             
@@ -1150,6 +1161,7 @@ HTML_TEMPLATE = """
             element.classList.add('active');
             
             if (tabName === 'overview') {
+                 // Ensure charts render correctly after tab visibility changes
                  setTimeout(renderCharts, 100); 
             }
         }
