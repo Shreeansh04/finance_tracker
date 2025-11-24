@@ -5,7 +5,7 @@ from pymongo import MongoClient
 from dotenv import load_dotenv
 import os
 from functools import wraps
-from bson.objectid import ObjectId # CRITICAL: Import ObjectId for the serialization fix
+from bson.objectid import ObjectId
 
 # Load environment variables from .env file (for local testing)
 load_dotenv() 
@@ -13,15 +13,11 @@ load_dotenv()
 app = Flask(__name__)
 
 # --- 1. CONFIGURATION (LOAD FROM ENVIRONMENT) ---
-# NOTE: Replace 'mongodb+srv://...' with your actual MongoDB Atlas connection string
 MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://user:pass@cluster.mongodb.net/financial_db?retryWrites=true&w=majority")
-# EXPLICITLY set the database name. If it's not in the URI, this will be used.
 MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "financial_db") 
-# This key is used to authorize API calls for adding/editing/deleting data
 SECRET_KEY = os.getenv("SECRET_KEY", "A_FALLBACK_SECRET_KEY_NEVER_USE_IN_PROD") 
 COLLECTION_NAME = os.getenv("MONGO_COLLECTION_NAME", "user_data")
 
-# Pass the secret key to the template for client-side authentication
 app.jinja_env.globals['SECRET_KEY'] = SECRET_KEY 
 
 
@@ -30,56 +26,59 @@ app.jinja_env.globals['SECRET_KEY'] = SECRET_KEY
 def get_mongo_collection():
     """Connects to MongoDB and returns the collection object."""
     try:
-        # Connect to the client
         client = MongoClient(MONGO_URI)
-        
-        # Explicitly use MONGO_DB_NAME to define the database
         db = client.get_database(MONGO_DB_NAME) 
-        
-        # A simple operation to check connection without retrieving data
         db.command('ping') 
-        
         return db[COLLECTION_NAME]
     except Exception as e:
-        # Increased visibility for the critical error
         print(f"!!! FATAL: Could not connect to MongoDB. Check MONGO_URI and MONGO_DB_NAME: {e}")
         return None
+
+# --- NEW HELPER FOR NaN FIX ---
+def _safe_float(value, default=0.0):
+    """Safely converts a value to a float, returning a default if conversion fails or if the value is NaN."""
+    try:
+        # Handle Python's float('nan') or float('inf') after conversion, 
+        # or when values are already floats from the DB.
+        f_value = float(value)
+        if f_value != f_value or f_value == float('inf') or f_value == float('-inf'):
+            return default
+        return f_value
+    except (ValueError, TypeError):
+        # Catches attempts to convert non-numeric strings (like 'hello', or empty string '')
+        return default
 
 def get_default_data():
     """Returns the initial/default data structure, including metadata."""
     today = datetime.now().strftime('%Y-%m-%d')
     return {
         'income': [
-            # inc1: Salary represents the RECURRING amount (inflow rate)
-            {'id': 'inc1', 'name': 'Monthly Salary', 'amount': 116938},
-            # inc2: Current Balance represents the DYNAMIC account balance
-            {'id': 'inc2', 'name': 'Current Account Balance', 'amount': 45000},
+            {'id': 'inc1', 'name': 'Monthly Salary', 'amount': 116938.0},
+            {'id': 'inc2', 'name': 'Current Account Balance', 'amount': 45000.0},
         ],
         'expenses': [
-            {'id': 'exp1', 'name': 'Rent', 'amount': 11000},
-            {'id': 'exp2', 'name': 'Cook', 'amount': 1500},
-            {'id': 'exp3', 'name': 'Groceries', 'amount': 3000},
-            {'id': 'exp4', 'name': 'Travelling', 'amount': 500},
-            {'id': 'exp5', 'name': 'Pakhi-Travelling', 'amount': 4000},
-            {'id': 'exp6', 'name': 'Pakhi', 'amount': 5000},
+            {'id': 'exp1', 'name': 'Rent', 'amount': 11000.0},
+            {'id': 'exp2', 'name': 'Cook', 'amount': 1500.0},
+            {'id': 'exp3', 'name': 'Groceries', 'amount': 3000.0},
+            {'id': 'exp4', 'name': 'Travelling', 'amount': 500.0},
+            {'id': 'exp5', 'name': 'Pakhi-Travelling', 'amount': 4000.0},
+            {'id': 'exp6', 'name': 'Pakhi', 'amount': 5000.0},
         ],
         'investments': [
-            {'id': 'inv1', 'name': 'Mutual Funds', 'amount': 17500},
-            {'id': 'inv2', 'name': 'Stocks', 'amount': 17500},
-            {'id': 'inv3', 'name': 'Liquid Fund', 'amount': 35000},
+            {'id': 'inv1', 'name': 'Mutual Funds', 'amount': 17500.0},
+            {'id': 'inv2', 'name': 'Stocks', 'amount': 17500.0},
+            {'id': 'inv3', 'name': 'Liquid Fund', 'amount': 35000.0},
         ],
         'debts': [
-            {'id': 'dbt1', 'name': 'Divyam', 'amount': 6500, 'monthlyPayment': 2000},
-            {'id': 'dbt2', 'name': 'Dada', 'amount': 50000, 'monthlyPayment': 5000},
+            {'id': 'dbt1', 'name': 'Divyam', 'amount': 6500.0, 'monthlyPayment': 2000.0},
+            {'id': 'dbt2', 'name': 'Dada', 'amount': 50000.0, 'monthlyPayment': 5000.0},
         ],
         'purchases': [ 
-            {'id': 'pur1', 'name': 'Furniture (Sofa)', 'amount': 35000, 'date': today},
+            {'id': 'pur1', 'name': 'Furniture (Sofa)', 'amount': 35000.0, 'date': today},
         ],
-        # NEW CATEGORY: One-Time Inflows
         'one_time_inflows': [
-            {'id': 'inflow1', 'name': 'Stock Dividend Payout', 'amount': 5000, 'date': today},
+            {'id': 'inflow1', 'name': 'Stock Dividend Payout', 'amount': 5000.0, 'date': today},
         ],
-        # Metadata to prevent double-counting of automatic monthly actions
         'metadata': {
             'last_balance_update_month': None, 
             'last_debt_payment_month': None    
@@ -95,13 +94,25 @@ def save_data(data_to_save):
         
     existing_doc = collection.find_one({}, {'_id': 1})
     
+    # Ensure numerical consistency before saving
+    for category in ['income', 'expenses', 'investments', 'purchases', 'one_time_inflows']:
+        data_to_save[category] = [_clean_item(item, ['amount']) for item in data_to_save.get(category, [])]
+
+    for item in data_to_save.get('debts', []):
+        item['amount'] = _safe_float(item.get('amount'))
+        item['monthlyPayment'] = _safe_float(item.get('monthlyPayment'))
+
     if existing_doc:
-        # Use the existing _id to update the document
         collection.replace_one({'_id': existing_doc['_id']}, data_to_save, upsert=True)
     else:
-        # No existing document found, insert a new one
         collection.insert_one(data_to_save)
 
+# Helper function for data cleaning during save/load
+def _clean_item(item, numeric_keys):
+    for key in numeric_keys:
+        if key in item:
+            item[key] = _safe_float(item[key])
+    return item
 
 # --- 3. AUTHENTICATION DECORATOR ---
 
@@ -109,25 +120,21 @@ def requires_auth(f):
     """Decorator to protect API endpoints using a secret key in the request header."""
     @wraps(f)
     def decorated(*args, **kwargs):
-        # Check for the secret key in the custom header
         auth_key = request.headers.get('X-Auth-Key')
         if auth_key and auth_key == SECRET_KEY:
             return f(*args, **kwargs)
         
         print(f"Authentication failed: Key received '{auth_key}' vs Key expected '{SECRET_KEY}'")
+        # Return a standard JSON error message for failed authentication
         return jsonify({"message": "Authentication Required: Invalid 'X-Auth-Key' header."}), 401
     return decorated
 
 
 # --- 4. UTILITY FUNCTIONS (DATE LOGIC) ---
-
 def is_working_day(date_obj):
-    """Checks if a date is Monday (0) through Friday (4)."""
     return date_obj.weekday() < 5
 
 def get_last_working_day(year, month, offset=1):
-    """Calculates the Nth last working day (Mon-Fri) of a month."""
-    
     last_day_num = calendar.monthrange(year, month)[1]
     day_to_check = datetime(year, month, last_day_num).date()
     
@@ -144,35 +151,25 @@ def get_last_working_day(year, month, offset=1):
     return None 
 
 def get_salary_date(year, month):
-    """Salary is the 3rd last working day of the month (offset=3)."""
     return get_last_working_day(year, month, offset=3)
 
 # --- 5. DYNAMIC UPDATE LOGIC ---
 
 def check_and_update_balance():
-    """
-    Performs time-based updates: salary credit and debt reduction.
-    Saves data if modified.
-    """
+    """Performs time-based updates: salary credit and debt reduction."""
     global data
     
     current_date = datetime.now().date()
     current_month_str = current_date.strftime('%Y-%m')
-    current_year = current_date.year
-    current_month = current_date.month
 
-    # Ensure metadata structure exists
     metadata = data.setdefault('metadata', {'last_balance_update_month': None, 'last_debt_payment_month': None})
     
     data_modified = False
     
-    # Locate the critical items
     salary_item = next((item for item in data.get('income', []) if item.get('id') == 'inc1'), None)
     balance_item = next((item for item in data.get('income', []) if item.get('id') == 'inc2'), None)
 
     # 1. Automatic Debt Reduction (Executed on the last calendar day of the month)
-    
-    # Calculate the last calendar day of the current month
     try:
         next_month_start = current_date.replace(day=1) + timedelta(days=32)
         last_day_of_month = next_month_start.replace(day=1) - timedelta(days=1)
@@ -187,14 +184,12 @@ def check_and_update_balance():
         total_payment = sum(debt.get('monthlyPayment', 0) for debt in data.get('debts', []))
 
         if balance_item:
-            # 1a. Reduce Current Balance by total debt payment
-            balance_item['amount'] = balance_item.get('amount', 0) - total_payment
+            balance_item['amount'] = _safe_float(balance_item.get('amount', 0)) - total_payment
         
-            # 1b. Reduce outstanding debt amount
             for debt in data.get('debts', []):
                 try:
-                    amount = debt.get('amount', 0)
-                    payment = debt.get('monthlyPayment', 0)
+                    amount = _safe_float(debt.get('amount', 0))
+                    payment = _safe_float(debt.get('monthlyPayment', 0))
                     debt['amount'] = max(0, amount - payment)
                 except (KeyError, TypeError):
                     continue
@@ -205,7 +200,7 @@ def check_and_update_balance():
 
     # 2. Salary Credit Logic (Executed on the 3rd Last Working Day)
     try:
-        salary_date = get_salary_date(current_year, current_month)
+        salary_date = get_salary_date(current_date.year, current_date.month)
     except Exception:
         salary_date = None
         
@@ -213,59 +208,59 @@ def check_and_update_balance():
         print(f"Executing salary credit for {current_month_str} on {salary_date}...")
         
         if salary_item and balance_item:
-            salary_amount = salary_item.get('amount', 0)
-            balance_item['amount'] = balance_item.get('amount', 0) + salary_amount
+            salary_amount = _safe_float(salary_item.get('amount', 0))
+            balance_item['amount'] = _safe_float(balance_item.get('amount', 0)) + salary_amount
             metadata['last_balance_update_month'] = current_month_str
             data_modified = True
             print("Salary credited.")
 
     if data_modified:
-        # Call save_data if modifications were made
         save_data(data)
         return True
     
     return False
 
 def load_data():
-    """Fetches data from MongoDB or creates a new document."""
+    """Fetches data from MongoDB, cleans it, and ensures structure."""
     global data
     collection = get_mongo_collection()
     
     if collection is None:
-        # Fallback to in-memory default if DB fails
         print("Warning: Using in-memory default data. Persistence disabled.") 
         data = get_default_data()
         return data
 
-    # Find the single document storing all the user's data
     data = collection.find_one({})
     
     if data is None:
-        # Create the initial document if none exists
         data = get_default_data()
         collection.insert_one(data)
     else:
-        # FIX FOR NEW CATEGORIES (Addressing TypeError from previous turn): 
-        # Ensure all expected lists exist, even if old MongoDB document didn't have them.
+        # Structure Fix (Ensure all expected keys exist)
         data.setdefault('income', [])
         data.setdefault('expenses', [])
         data.setdefault('investments', [])
         data.setdefault('debts', [])
         data.setdefault('purchases', [])
-        data.setdefault('one_time_inflows', []) # <-- CRITICAL FIX
+        data.setdefault('one_time_inflows', [])
+        data.setdefault('metadata', {'last_balance_update_month': None, 'last_debt_payment_month': None})
+        
+        # --- DATA CLEANING FIX (CRITICAL FOR NaN/Non-numeric strings) ---
+        for category in ['income', 'expenses', 'investments', 'purchases', 'one_time_inflows']:
+            data[category] = [_clean_item(item, ['amount']) for item in data.get(category, [])]
 
+        for item in data.get('debts', []):
+            item['amount'] = _safe_float(item.get('amount'))
+            item['monthlyPayment'] = _safe_float(item.get('monthlyPayment'))
+            
         # --- JSON SERIALIZATION FIX ---
-        # Remove the MongoDB ObjectId field before returning it to Flask.
         if '_id' in data and isinstance(data['_id'], ObjectId):
             data.pop('_id', None)
-        # -----------------------------
         
-    # Check and perform automatic updates (debt payment, salary credit)
     check_and_update_balance() 
     
     return data
 
-# Load the data when the application starts
 data = load_data()
 
 # --- 6. CALCULATION HELPER ---
@@ -273,84 +268,70 @@ data = load_data()
 def calculate_totals():
     global data 
     
-    # --- Current Month Filtering ---
     today = datetime.now()
     current_month_year = (today.year, today.month)
     
     # Purchases
     current_month_purchases_total = 0
     total_all_time_purchases = 0
-    # Use .get('purchases', []) for robustness
     for item in data.get('purchases', []): 
         try:
-            amount = float(item.get('amount', 0))
+            amount = _safe_float(item.get('amount', 0))
             total_all_time_purchases += amount
             purchase_date = datetime.strptime(item.get('date', '1900-01-01'), '%Y-%m-%d')
-            
             if (purchase_date.year, purchase_date.month) == current_month_year:
                 current_month_purchases_total += amount
         except (ValueError, TypeError):
             continue
 
-    # NEW: One-Time Inflows
+    # One-Time Inflows
     current_month_inflows_total = 0
     total_all_time_inflows = 0
-    # Use .get('one_time_inflows', []) for robustness
     for item in data.get('one_time_inflows', []): 
         try:
-            amount = float(item.get('amount', 0))
+            amount = _safe_float(item.get('amount', 0))
             total_all_time_inflows += amount
             inflow_date = datetime.strptime(item.get('date', '1900-01-01'), '%Y-%m-%d')
-            
             if (inflow_date.year, inflow_date.month) == current_month_year:
                 current_month_inflows_total += amount
         except (ValueError, TypeError):
             continue
 
-    # --- Income/Balance Calculation ---
-    balance_item = next((item for item in data.get('income', []) if item.get('id') == 'inc2'), {'amount': 0})
-    current_balance = balance_item.get('amount', 0)
+    # Income/Balance Calculation
+    balance_item = next((item for item in data.get('income', []) if item.get('id') == 'inc2'), {'amount': 0.0})
+    current_balance = _safe_float(balance_item.get('amount', 0.0))
     
     # totalIncomeRate: Sum of all income items EXCEPT the 'Current Account Balance' item (inc2)
-    total_income_rate = sum(item['amount'] for item in data.get('income', []) if item.get('id') != 'inc2')
+    total_income_rate = sum(_safe_float(item.get('amount', 0.0)) for item in data.get('income', []) if item.get('id') != 'inc2')
 
-    # --- Outflow Calculation ---
-    total_expenses = sum(item['amount'] for item in data.get('expenses', []))
-    total_investments = sum(item['amount'] for item in data.get('investments', []))
-    total_debt_payment = sum(item.get('monthlyPayment', 0) for item in data.get('debts', []))
-    total_debt = sum(item['amount'] for item in data.get('debts', []))
+    # Outflow Calculation
+    total_expenses = sum(_safe_float(item.get('amount', 0.0)) for item in data.get('expenses', []))
+    total_investments = sum(_safe_float(item.get('amount', 0.0)) for item in data.get('investments', []))
+    total_debt_payment = sum(_safe_float(debt.get('monthlyPayment', 0.0)) for debt in data.get('debts', []))
+    total_debt = sum(_safe_float(item.get('amount', 0.0)) for item in data.get('debts', []))
     
     # Monthly Recurring Outflow for *Budgeting Forecast*
     monthly_recurring_outflow = total_expenses + total_investments + total_debt_payment
     
-    # Total Outflow (used for the Total Cash Flow Movement chart/stat)
     total_outflow_for_stats = monthly_recurring_outflow + current_month_purchases_total
-    
-    # Total Inflow for stats (Recurring + One-Time)
     total_inflow_for_stats = total_income_rate + current_month_inflows_total
     
-    # Monthly Forecast Remaining calculation
     remaining_after_recurring = total_income_rate - monthly_recurring_outflow
 
     return {
-        'currentBalance': current_balance, # The actual cash in hand
-        'totalIncomeRate': total_income_rate, # The monthly income rate (e.g., salary only)
-        
+        'currentBalance': current_balance, 
+        'totalIncomeRate': total_income_rate, 
         'totalExpenses': total_expenses,
         'totalInvestments': total_investments,
         'totalDebt': total_debt,
         'totalDebtPayment': total_debt_payment,
-        
         'currentMonthPurchasesTotal': current_month_purchases_total,
         'totalAllTimePurchases': total_all_time_purchases,
-        
-        # NEW INFLOW STATS
         'currentMonthInflowsTotal': current_month_inflows_total,
         'totalAllTimeInflows': total_all_time_inflows,
-        'totalInflowForStats': total_inflow_for_stats, # Recurring Income Rate + Current Month One-Time Inflows
-        
-        'totalOutflow': total_outflow_for_stats, # Total money movement this month
-        'remainingBalance': remaining_after_recurring, # Forecasted remaining money from recurring flow
+        'totalInflowForStats': total_inflow_for_stats, 
+        'totalOutflow': total_outflow_for_stats,
+        'remainingBalance': remaining_after_recurring,
         'isPositive': remaining_after_recurring >= 0
     }
 
@@ -363,52 +344,49 @@ def index():
 
 @app.route('/api/data')
 def get_data():
-    # Recalculate totals just before sending
     totals = calculate_totals() 
-    
-    # data is guaranteed to not contain '_id' field here
     return jsonify({
         **data,
         **totals
     })
 
 @app.route('/api/add', methods=['POST'])
-@requires_auth # Protected
+@requires_auth
 def add_item():
     global data
     req = request.json
     category = req.get('category')
-    item = req.get('item')
+    item = req.get('item', {})
     
     data_modified = False
     
     if category in data and isinstance(data[category], list):
-        # Generate a temporary unique ID
         if 'id' not in item:
             item['id'] = 'item-' + os.urandom(4).hex()
             
+        # Clean item before appending/processing
+        if 'amount' in item:
+            item['amount'] = _safe_float(item['amount'])
+        if 'monthlyPayment' in item:
+            item['monthlyPayment'] = _safe_float(item['monthlyPayment'])
+
         data[category].append(item)
         
-        # SPECIAL LOGIC: Update current balance for one-time inflows
         if category == 'one_time_inflows':
             balance_item = next((i for i in data.get('income', []) if i.get('id') == 'inc2'), None)
             if balance_item and 'amount' in item:
-                try:
-                    inflow_amount = float(item['amount'])
-                    balance_item['amount'] = balance_item.get('amount', 0) + inflow_amount
-                    print(f"Updated current balance with one-time inflow of: {inflow_amount}")
-                except ValueError:
-                    print(f"Warning: Invalid number value '{item['amount']}' for one-time inflow.")
-        
+                inflow_amount = item.get('amount', 0.0)
+                balance_item['amount'] = _safe_float(balance_item.get('amount', 0.0)) + inflow_amount
+                print(f"Updated current balance with one-time inflow of: {inflow_amount}")
+
         save_data(data)
         data_modified = True
     
-    # Recalculate totals and return the updated state
     totals = calculate_totals()
     return jsonify({'success': data_modified, **totals})
 
 @app.route('/api/update', methods=['POST'])
-@requires_auth # Protected
+@requires_auth
 def update_item():
     global data
     req = request.json
@@ -423,27 +401,21 @@ def update_item():
         for item in data[category]:
             if item.get('id') == item_id:
                 
-                old_value = item.get(field)
+                old_value = _safe_float(item.get(field, 0.0))
                 
-                # Handle numeric fields
                 if field in ['amount', 'monthlyPayment']:
-                    try:
-                        new_value = float(value)
-                        
-                        # SPECIAL LOGIC: Adjust current balance if amount changes for One-Time Inflows
-                        if category == 'one_time_inflows' and field == 'amount':
-                            balance_item = next((i for i in data.get('income', []) if i.get('id') == 'inc2'), None)
-                            if balance_item:
-                                # Delta = New Amount - Old Amount
-                                delta = new_value - (float(old_value) if old_value is not None else 0)
-                                balance_item['amount'] = balance_item.get('amount', 0) + delta
-                                print(f"Adjusted current balance by {delta} due to update in one-time inflow.")
-                        
-                        item[field] = new_value
-                        data_modified = True
-                    except ValueError:
-                        print(f"Warning: Invalid number value '{value}' for field '{field}'")
-                # Handle all other fields (name, date)
+                    # Use safe_float to ensure proper number and prevent NaN in DB
+                    new_value = _safe_float(value) 
+                    
+                    if category == 'one_time_inflows' and field == 'amount':
+                        balance_item = next((i for i in data.get('income', []) if i.get('id') == 'inc2'), None)
+                        if balance_item:
+                            delta = new_value - old_value
+                            balance_item['amount'] = _safe_float(balance_item.get('amount', 0.0)) + delta
+                            print(f"Adjusted current balance by {delta} due to update in one-time inflow.")
+                    
+                    item[field] = new_value
+                    data_modified = True
                 else:
                     item[field] = value
                     data_modified = True
@@ -452,12 +424,11 @@ def update_item():
         if data_modified:
             save_data(data)
     
-    # Recalculate totals and return the updated state
     totals = calculate_totals()
     return jsonify({'success': True, **totals})
 
 @app.route('/api/delete', methods=['POST'])
-@requires_auth # Protected
+@requires_auth
 def delete_item():
     global data
     req = request.json
@@ -467,32 +438,24 @@ def delete_item():
     item_to_delete = None
     
     if category in data and isinstance(data[category], list):
-        # Find item before filtering it out for balance adjustment
         item_to_delete = next((item for item in data[category] if item.get('id') == item_id), None)
         
-        # Filter the list, effectively deleting the item
         data[category] = [item for item in data[category] if item.get('id') != item_id]
         
-        # SPECIAL LOGIC: Adjust current balance if deleting a One-Time Inflow
         if category == 'one_time_inflows' and item_to_delete:
             balance_item = next((i for i in data.get('income', []) if i.get('id') == 'inc2'), None)
             if balance_item and 'amount' in item_to_delete:
-                try:
-                    inflow_amount = float(item_to_delete['amount'])
-                    # Deleting an inflow means subtracting the amount from the balance
-                    balance_item['amount'] = balance_item.get('amount', 0) - inflow_amount
-                    print(f"Adjusted current balance by -{inflow_amount} after deleting one-time inflow.")
-                except ValueError:
-                    print("Warning: Could not adjust balance on delete due to invalid amount.")
+                inflow_amount = _safe_float(item_to_delete.get('amount', 0.0))
+                balance_item['amount'] = _safe_float(balance_item.get('amount', 0.0)) - inflow_amount
+                print(f"Adjusted current balance by -{inflow_amount} after deleting one-time inflow.")
 
         save_data(data)
     
-    # Recalculate totals and return the updated state
     totals = calculate_totals()
     return jsonify({'success': True, **totals})
 
 
-# --- 8. HTML TEMPLATE DEFINITION (Frontend Logic Update for Auth) ---
+# --- 8. HTML TEMPLATE DEFINITION (Frontend Logic) ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -802,7 +765,8 @@ HTML_TEMPLATE = """
         <div class="tabs">
             <button class="tab-btn active" onclick="switchTab('overview', this)">📊 Overview</button>
             <button class="tab-btn" onclick="switchTab('income', this)">💵 Income</button>
-            <button class="tab-btn" onclick="switchTab('one_time_inflows', this)">⬆️ One-Time Inflows</button> <button class="tab-btn" onclick="switchTab('expenses', this)">💸 Expenses</button>
+            <button class="tab-btn" onclick="switchTab('one_time_inflows', this)">⬆️ One-Time Inflows</button> 
+            <button class="tab-btn" onclick="switchTab('expenses', this)">💸 Expenses</button>
             <button class="tab-btn" onclick="switchTab('investments', this)">📈 Investments</button>
             <button class="tab-btn" onclick="switchTab('debts', this)">💳 Debts</button>
             <button class="tab-btn" onclick="switchTab('purchases', this)">🛒 Purchases</button> 
@@ -829,6 +793,7 @@ HTML_TEMPLATE = """
             <div id="oneTimeInflowsList"></div>
             <button class="btn-add" onclick="addItem('one_time_inflows')">➕ Record New Inflow</button>
         </div>
+        
         <div id="expenses" class="section">
             <h2>💸 Monthly Expenses (Recurring)</h2>
             <div id="expensesList"></div>
@@ -859,7 +824,6 @@ HTML_TEMPLATE = """
     </div>
     
     <script>
-        // CRITICAL: The server passes the SECRET_KEY to this variable for client-side authentication
         const AUTH_KEY = "{{ SECRET_KEY }}"; 
 
         let appData = {};
@@ -871,7 +835,6 @@ HTML_TEMPLATE = """
         async function fetchData(url, method = 'GET', body = null) {
             const headers = { 'Content-Type': 'application/json' };
             
-            // Add auth header only for modification requests
             if (method !== 'GET') {
                 headers['X-Auth-Key'] = AUTH_KEY;
             }
@@ -885,17 +848,19 @@ HTML_TEMPLATE = """
                 const response = await fetch(url, options);
 
                 if (response.status === 401) {
-                     // Using console.error instead of alert/confirm
                      console.error('Authentication failed. Check your AUTH_KEY and deployment settings.');
                      return null;
                 }
                 if (!response.ok) {
-                    const errorBody = await response.json().catch(() => ({}));
-                    console.error(`HTTP error! status: ${response.status}`, errorBody);
-                    // Throw to ensure the calling async function knows to stop
-                    throw new Error('Failed to perform operation.');
+                    const errorText = await response.text();
+                    console.error(`HTTP error! status: ${response.status}`, errorText);
+                    throw new Error('Failed to perform operation or received invalid data.');
                 }
-                return response.json();
+                
+                // CRITICAL: The error comes from response.json() trying to parse "NaN"
+                const result = await response.json();
+                return result;
+
             } catch (error) {
                 console.error("Fetch error:", error);
                 return null;
@@ -922,8 +887,7 @@ HTML_TEMPLATE = """
         }
         
         function renderStats() {
-            // Updated stats to include new inflow data
-            const { currentBalance, totalIncomeRate, totalDebt, remainingBalance, isPositive, totalOutflow, currentMonthPurchasesTotal, currentMonthInflowsTotal } = appData;
+            const { currentBalance, totalIncomeRate, totalDebt, remainingBalance, isPositive, currentMonthInflowsTotal } = appData;
             
             const formatCurrency = (amount) => (amount || 0).toLocaleString('en-IN', {maximumFractionDigits: 0});
 
@@ -956,7 +920,6 @@ HTML_TEMPLATE = """
         function renderIncome() {
             const formatCurrency = (amount) => (amount || 0).toLocaleString('en-IN', {maximumFractionDigits: 0});
             
-            // Use appData.income || [] for robustness
             const html = (appData.income || []).map(item => `
                 <div class="item-row" style="${item.id === 'inc2' ? 'background: #f0f0ff;' : ''}">
                     <input type="text" value="${item.name}" onchange="updateField('income', '${item.id}', 'name', this.value)" ${item.id === 'inc2' ? 'readonly' : ''}>
@@ -971,10 +934,8 @@ HTML_TEMPLATE = """
         function renderOneTimeInflows() {
             const formatCurrency = (amount) => (amount || 0).toLocaleString('en-IN', {maximumFractionDigits: 0});
             
-            // FIX: Ensure it is an array before calling slice()
             const inflows = appData.one_time_inflows || []; 
             
-            // Sort inflows by date descending
             const sortedInflows = inflows.slice().sort((a, b) => {
                 const dateA = a.date || '1900-01-01';
                 const dateB = b.date || '1900-01-01';
@@ -1053,10 +1014,8 @@ HTML_TEMPLATE = """
         function renderPurchases() { 
             const formatCurrency = (amount) => (amount || 0).toLocaleString('en-IN', {maximumFractionDigits: 0});
             
-            // Use appData.purchases || [] for robustness
             const purchases = appData.purchases || [];
 
-            // Sort purchases by date descending
             const sortedPurchases = purchases.slice().sort((a, b) => {
                 const dateA = a.date || '1900-01-01';
                 const dateB = b.date || '1900-01-01';
@@ -1089,8 +1048,16 @@ HTML_TEMPLATE = """
             Object.values(chartInstances).forEach(chart => chart?.destroy());
             chartInstances = {};
             
-            const recurringOutflow = totalExpenses + totalInvestments + totalDebtPayment;
-            const forecastedRemaining = Math.max(totalIncomeRate - recurringOutflow, 0); 
+            // Use logical defaults if NaN somehow slips past the Python cleanup (frontend safety)
+            const safeExpenses = totalExpenses || 0;
+            const safeInvestments = totalInvestments || 0;
+            const safeDebtPayment = totalDebtPayment || 0;
+            const safeIncomeRate = totalIncomeRate || 0;
+            const safeInflowStats = totalInflowForStats || 0;
+            const safeOutflow = totalOutflow || 0;
+
+            const recurringOutflow = safeExpenses + safeInvestments + safeDebtPayment;
+            const forecastedRemaining = Math.max(safeIncomeRate - recurringOutflow, 0); 
 
             // Cash Flow Pie Chart (Shows recurring budget allocation)
             const ctx1 = document.getElementById('cashFlowChart');
@@ -1100,7 +1067,7 @@ HTML_TEMPLATE = """
                     data: {
                         labels: ['Expenses (Recurring)', 'Investments', 'Debt Payments', 'Remaining (Forecast)'],
                         datasets: [{
-                            data: [totalExpenses, totalInvestments, totalDebtPayment, forecastedRemaining],
+                            data: [safeExpenses, safeInvestments, safeDebtPayment, forecastedRemaining],
                             backgroundColor: ['#f56565', '#4299e1', '#ed8936', '#48bb78']
                         }]
                     },
@@ -1118,11 +1085,10 @@ HTML_TEMPLATE = """
                 chartInstances.breakdown = new Chart(ctx2, {
                     type: 'bar',
                     data: {
-                        // totalInflowForStats is the new metric (Recurring Income Rate + Current Month One-Time Inflows)
                         labels: ['Total Inflow (This Month)', 'Total Outflow (This Month)'],
                         datasets: [{
                             label: 'Amount (₹)',
-                            data: [totalInflowForStats, totalOutflow],
+                            data: [safeInflowStats, safeOutflow],
                             backgroundColor: ['#48bb78', '#f56565']
                         }]
                     },
@@ -1145,7 +1111,6 @@ HTML_TEMPLATE = """
         }
         
         async function deleteItem(category, id) {
-            // IMPORTANT: Replacing window.confirm() with a console warning as alert/confirm is forbidden
             if (category === 'income' && id === 'inc2') {
                 console.warn('The Current Account Balance item cannot be deleted.');
                 return;
@@ -1158,7 +1123,6 @@ HTML_TEMPLATE = """
         }
         
         async function addItem(category) {
-            // Generate a temporary unique ID
             const id = 'item-' + Math.random().toString(36).substr(2, 9);
             const today = new Date().toISOString().slice(0, 10); 
             
@@ -1167,7 +1131,7 @@ HTML_TEMPLATE = """
                 item = { id, name: 'New Debt', amount: 0, monthlyPayment: 0 };
             } else if (category === 'purchases') { 
                 item = { id, name: 'New Purchase', amount: 0, date: today }; 
-            } else if (category === 'one_time_inflows') { // NEW LOGIC
+            } else if (category === 'one_time_inflows') { 
                 item = { id, name: 'New Inflow', amount: 0, date: today }; 
             } else if (category === 'income') {
                 item = { id, name: 'Other Monthly Income', amount: 0 }; 
@@ -1186,7 +1150,6 @@ HTML_TEMPLATE = """
             element.classList.add('active');
             
             if (tabName === 'overview') {
-                 // Ensure charts render correctly after tab visibility changes
                  setTimeout(renderCharts, 100); 
             }
         }
