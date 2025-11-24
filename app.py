@@ -36,9 +36,6 @@ def get_mongo_collection():
         # Explicitly use MONGO_DB_NAME to define the database
         db = client.get_database(MONGO_DB_NAME) 
         
-        # Log to debug connection status
-        print(f"Attempting to connect to database: {MONGO_DB_NAME}")
-        
         # A simple operation to check connection without retrieving data
         db.command('ping') 
         
@@ -96,13 +93,6 @@ def save_data(data_to_save):
         print("Error: Database connection failed. Cannot save data.")
         return
         
-    # We must ensure the _id field is present for replacement, but it must be 
-    # the actual ObjectId instance if it exists in the data global variable.
-    # If the _id was removed in load_data for serialization, it will not be 
-    # present here, so we just use replace_one with an empty filter to target 
-    # the single document (or insert if none exists).
-    
-    # Try to find the document's actual _id from the database first for a safer update
     existing_doc = collection.find_one({}, {'_id': 1})
     
     if existing_doc:
@@ -183,12 +173,10 @@ def check_and_update_balance():
     # 1. Automatic Debt Reduction (Executed on the last calendar day of the month)
     
     # Calculate the last calendar day of the current month
-    # This is a safe way to find the last day of the current month
     try:
         next_month_start = current_date.replace(day=1) + timedelta(days=32)
         last_day_of_month = next_month_start.replace(day=1) - timedelta(days=1)
     except ValueError:
-        # Should not happen, but safe fallback
         last_day_of_month = current_date 
         
     is_eom = current_date == last_day_of_month
@@ -255,12 +243,19 @@ def load_data():
     if data is None:
         # Create the initial document if none exists
         data = get_default_data()
-        # Insert the initial data
         collection.insert_one(data)
     else:
+        # FIX FOR NEW CATEGORIES (Addressing TypeError from previous turn): 
+        # Ensure all expected lists exist, even if old MongoDB document didn't have them.
+        data.setdefault('income', [])
+        data.setdefault('expenses', [])
+        data.setdefault('investments', [])
+        data.setdefault('debts', [])
+        data.setdefault('purchases', [])
+        data.setdefault('one_time_inflows', []) # <-- CRITICAL FIX
+
         # --- JSON SERIALIZATION FIX ---
-        # FIX: Remove the MongoDB ObjectId field before returning it to Flask, 
-        # because Flask's jsonify cannot serialize this BSON type.
+        # Remove the MongoDB ObjectId field before returning it to Flask.
         if '_id' in data and isinstance(data['_id'], ObjectId):
             data.pop('_id', None)
         # -----------------------------
@@ -285,7 +280,8 @@ def calculate_totals():
     # Purchases
     current_month_purchases_total = 0
     total_all_time_purchases = 0
-    for item in data.get('purchases', []):
+    # Use .get('purchases', []) for robustness
+    for item in data.get('purchases', []): 
         try:
             amount = float(item.get('amount', 0))
             total_all_time_purchases += amount
@@ -299,7 +295,8 @@ def calculate_totals():
     # NEW: One-Time Inflows
     current_month_inflows_total = 0
     total_all_time_inflows = 0
-    for item in data.get('one_time_inflows', []):
+    # Use .get('one_time_inflows', []) for robustness
+    for item in data.get('one_time_inflows', []): 
         try:
             amount = float(item.get('amount', 0))
             total_all_time_inflows += amount
@@ -369,9 +366,7 @@ def get_data():
     # Recalculate totals just before sending
     totals = calculate_totals() 
     
-    # Note: data should not contain '_id' field here, as it was removed in load_data()
-    # If a save operation happened and somehow brought _id back, this jsonify call 
-    # would crash. By removing it in load_data, we ensure it's safe.
+    # data is guaranteed to not contain '_id' field here
     return jsonify({
         **data,
         **totals
@@ -388,8 +383,7 @@ def add_item():
     data_modified = False
     
     if category in data and isinstance(data[category], list):
-        # Generate a temporary unique ID (must be done on client side for immediate UI update, 
-        # but also safe to generate here if it wasn't provided)
+        # Generate a temporary unique ID
         if 'id' not in item:
             item['id'] = 'item-' + os.urandom(4).hex()
             
@@ -919,7 +913,7 @@ HTML_TEMPLATE = """
         function render() {
             renderStats();
             renderIncome();
-            renderOneTimeInflows(); // NEW RENDER FUNCTION
+            renderOneTimeInflows(); 
             renderExpenses();
             renderInvestments();
             renderDebts();
@@ -962,7 +956,8 @@ HTML_TEMPLATE = """
         function renderIncome() {
             const formatCurrency = (amount) => (amount || 0).toLocaleString('en-IN', {maximumFractionDigits: 0});
             
-            const html = appData.income.map(item => `
+            // Use appData.income || [] for robustness
+            const html = (appData.income || []).map(item => `
                 <div class="item-row" style="${item.id === 'inc2' ? 'background: #f0f0ff;' : ''}">
                     <input type="text" value="${item.name}" onchange="updateField('income', '${item.id}', 'name', this.value)" ${item.id === 'inc2' ? 'readonly' : ''}>
                     <input type="number" value="${item.amount}" onchange="updateField('income', '${item.id}', 'amount', parseFloat(this.value))" ${item.id === 'inc2' ? 'readonly' : ''}>
@@ -973,12 +968,14 @@ HTML_TEMPLATE = """
             document.getElementById('incomeList').innerHTML = html + `<div class="total-row">Total Income Rate <span>₹${formatCurrency(appData.totalIncomeRate)}</span></div>`;
         }
         
-        // NEW RENDER FUNCTION
         function renderOneTimeInflows() {
             const formatCurrency = (amount) => (amount || 0).toLocaleString('en-IN', {maximumFractionDigits: 0});
             
+            // FIX: Ensure it is an array before calling slice()
+            const inflows = appData.one_time_inflows || []; 
+            
             // Sort inflows by date descending
-            const sortedInflows = appData.one_time_inflows.slice().sort((a, b) => {
+            const sortedInflows = inflows.slice().sort((a, b) => {
                 const dateA = a.date || '1900-01-01';
                 const dateB = b.date || '1900-01-01';
                 return dateB.localeCompare(dateA);
@@ -1003,11 +1000,10 @@ HTML_TEMPLATE = """
                     <span>₹${formatCurrency(appData.totalAllTimeInflows)}</span>
                 </div>`;
         }
-        // END NEW RENDER FUNCTION
-
+        
         function renderExpenses() {
             const formatCurrency = (amount) => (amount || 0).toLocaleString('en-IN', {maximumFractionDigits: 0});
-            const html = appData.expenses.map(item => `
+            const html = (appData.expenses || []).map(item => `
                 <div class="item-row">
                     <input type="text" value="${item.name}" onchange="updateField('expenses', '${item.id}', 'name', this.value)">
                     <input type="number" value="${item.amount}" onchange="updateField('expenses', '${item.id}', 'amount', parseFloat(this.value))">
@@ -1020,7 +1016,7 @@ HTML_TEMPLATE = """
         
         function renderInvestments() {
             const formatCurrency = (amount) => (amount || 0).toLocaleString('en-IN', {maximumFractionDigits: 0});
-            const html = appData.investments.map(item => `
+            const html = (appData.investments || []).map(item => `
                 <div class="item-row">
                     <input type="text" value="${item.name}" onchange="updateField('investments', '${item.id}', 'name', this.value)">
                     <input type="number" value="${item.amount}" onchange="updateField('investments', '${item.id}', 'amount', parseFloat(this.value))">
@@ -1032,7 +1028,7 @@ HTML_TEMPLATE = """
         }
         
         function renderDebts() {
-            const html = appData.debts.map(item => {
+            const html = (appData.debts || []).map(item => {
                 const amount = parseFloat(item.amount) || 0;
                 const monthlyPayment = parseFloat(item.monthlyPayment) || 0;
 
@@ -1057,8 +1053,11 @@ HTML_TEMPLATE = """
         function renderPurchases() { 
             const formatCurrency = (amount) => (amount || 0).toLocaleString('en-IN', {maximumFractionDigits: 0});
             
+            // Use appData.purchases || [] for robustness
+            const purchases = appData.purchases || [];
+
             // Sort purchases by date descending
-            const sortedPurchases = appData.purchases.slice().sort((a, b) => {
+            const sortedPurchases = purchases.slice().sort((a, b) => {
                 const dateA = a.date || '1900-01-01';
                 const dateB = b.date || '1900-01-01';
                 return dateB.localeCompare(dateA);
@@ -1152,7 +1151,6 @@ HTML_TEMPLATE = """
                 return;
             }
             
-            // In a real application, replace this with a custom modal.
             console.warn(`[Action Warning] Attempting to delete item: ${id} from ${category}.`);
             
             const result = await fetchData('/api/delete', 'POST', { category, id });
@@ -1160,7 +1158,7 @@ HTML_TEMPLATE = """
         }
         
         async function addItem(category) {
-            // Generate a temporary unique ID (Note: Backend also ensures uniqueness)
+            // Generate a temporary unique ID
             const id = 'item-' + Math.random().toString(36).substr(2, 9);
             const today = new Date().toISOString().slice(0, 10); 
             
@@ -1177,7 +1175,6 @@ HTML_TEMPLATE = """
                 item = { id, name: 'New Item', amount: 0 };
             }
             
-            // NOTE: The backend handles the currentBalance update for one_time_inflows when item.amount > 0
             const result = await fetchData('/api/add', 'POST', { category, item });
             if (result) await loadData();
         }
